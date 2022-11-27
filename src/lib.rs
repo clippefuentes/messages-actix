@@ -1,8 +1,11 @@
 #[macro_use]
 extern crate actix_web;
 
-use actix_web::{middleware, web, App, HttpRequest, HttpServer, Result};
-use serde::Serialize;
+use actix_web::{
+  error::{Error, InternalError, JsonPayloadError},
+  middleware, web, App, HttpRequest, HttpResponse, HttpServer, Result
+};
+use serde::{Serialize, Deserialize};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +23,25 @@ struct IndexResponse {
   server_id: usize,
   request_count: usize,
   messages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PostInput {
+  message: String,
+}
+
+#[derive(Serialize)]
+struct PostResponse {
+  server_id: usize,
+  request_count: usize,
+  message: String,
+}
+
+#[derive(Serialize)]
+struct PostError {
+  server_id: usize,
+  request_count: usize,
+  error: String,
 }
 
 pub struct MessageApp {
@@ -43,6 +65,16 @@ impl MessageApp {
         })
         .wrap(middleware::Logger::default())
         .service(index)
+        .service(
+          web::resource("/send")
+            .data(
+              web::JsonConfig::default()
+                .limit(4096)
+                .error_handler(post_error)
+            )
+            .route(web::post().to(post)),
+        )
+        .service(clear)
     })
     .bind(("127.0.0.1", self.port))?
     .workers(8)
@@ -61,4 +93,42 @@ fn index(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> {
     request_count,
     messages: ms.clone(),
   }))
+}
+
+fn post(msg: web::Json<PostInput>, state: web::Data<AppState>) -> Result<web::Json<PostResponse>> {
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let mut ms = state.messages.lock().unwrap();
+  ms.push(msg.message.clone());
+  Ok(web::Json(PostResponse {
+    server_id: state.server_id,
+    request_count,
+    message: msg.message.clone(),
+  }))
+}
+
+#[post("/clear")]
+fn clear(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> {
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let mut ms = state.messages.lock().unwrap();
+  ms.clear();
+  Ok(web::Json(IndexResponse {
+    server_id: state.server_id,
+    request_count,
+    messages: vec![],
+  }))
+}
+
+fn post_error(err: JsonPayloadError, req: &HttpRequest) -> Error {
+  let extns = req.extensions();
+  let state = extns.get::<web::Data<AppState>>().unwrap();
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let post_error = PostError {
+    server_id: state.server_id,
+    request_count,
+    error: format!("{}", err),
+  };
+  InternalError::from_response(err, HttpResponse::BadRequest().json(post_error)).into()
 }
